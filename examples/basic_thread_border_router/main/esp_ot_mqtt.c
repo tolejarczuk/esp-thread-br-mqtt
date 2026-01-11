@@ -21,12 +21,27 @@
 #include "openthread/ip6.h"
 #include "openthread/udp.h"
 #include "openthread/message.h"
+#include "openthread/link.h"
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "esp_crt_bundle.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "esp_ot_mqtt";
+
+// Device registry for Extended MAC to ML-EID mapping
+#define MAX_REGISTERED_DEVICES 32
+
+typedef struct {
+    uint8_t ext_mac[8];           // Extended MAC address
+    struct in6_addr ml_eid;       // ML-EID IPv6 address
+    bool in_use;                  // Is this entry active?
+    uint32_t last_seen;           // Timestamp of last registration/activity
+} device_registry_entry_t;
+
+static device_registry_entry_t s_device_registry[MAX_REGISTERED_DEVICES];
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static char s_base_topic[128] = {0};
@@ -84,11 +99,44 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         char topic_str[256] = {0};
         snprintf(topic_str, sizeof(topic_str), "%.*s", event->topic_len, event->topic);
         
+        // Check for device registration messages
+        char register_topic[256];
+        snprintf(register_topic, sizeof(register_topic), "%s/cmd/register", s_base_topic);
+        
+        if (strstr(topic_str, register_topic) != NULL) {
+            // Parse JSON: {"mac":"ca7bf088c6e9bb2a", "ml_eid":"fd64:f0dd:8948:b4b1:4d0e:fbfa:552f:b1cd"}
+            char *data_copy = strndup(event->data, event->data_len);
+            if (data_copy) {
+                cJSON *json = cJSON_Parse(data_copy);
+                if (json) {
+                    cJSON *mac = cJSON_GetObjectItem(json, "mac");
+                    cJSON *ml_eid = cJSON_GetObjectItem(json, "ml_eid");
+                    
+                    if (cJSON_IsString(mac) && cJSON_IsString(ml_eid)) {
+                        ESP_LOGI(TAG, "Device registration: MAC=%s, ML-EID=%s", 
+                                mac->valuestring, ml_eid->valuestring);
+                        esp_err_t ret = esp_ot_mqtt_register_device(mac->valuestring, ml_eid->valuestring);
+                        if (ret == ESP_OK) {
+                            // Publish registration confirmation
+                            char confirm_topic[256];
+                            snprintf(confirm_topic, sizeof(confirm_topic), "%s/status/registered", s_base_topic);
+                            esp_mqtt_client_publish(client, confirm_topic, mac->valuestring, 0, 1, 0);
+                            ESP_LOGI(TAG, "Device registered successfully");
+                        } else {
+                            ESP_LOGW(TAG, "Failed to register device");
+                        }
+                    }
+                    cJSON_Delete(json);
+                }
+                free(data_copy);
+            }
+        }
+        
         char device_cmd_topic[256];
         snprintf(device_cmd_topic, sizeof(device_cmd_topic), "%s/cmd/device", s_base_topic);
         
         if (strstr(topic_str, device_cmd_topic) != NULL) {
-            // Parse JSON message: {\"mac\":\"001122334455aabb\", \"payload\":\"data\"}
+            // Parse JSON message: {"mac":"001122334455aabb", "payload":"data"}
             char *data_copy = strndup(event->data, event->data_len);
             if (data_copy) {
                 cJSON *json = cJSON_Parse(data_copy);
@@ -353,6 +401,73 @@ static esp_err_t hex_string_to_bytes(const char *hex_str, uint8_t *bytes, size_t
 }
 
 /**
+ * @brief Register a Thread device's ML-EID address
+ */
+esp_err_t esp_ot_mqtt_register_device(const char *ext_mac, const char *ml_eid_str)
+{
+    if (!ext_mac || !ml_eid_str) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Convert MAC string to bytes
+    uint8_t mac_bytes[8];
+    if (hex_string_to_bytes(ext_mac, mac_bytes, 8) != ESP_OK) {
+        ESP_LOGE(TAG, "Invalid MAC address format: %s", ext_mac);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Parse ML-EID IPv6 address
+    struct in6_addr ml_eid;
+    if (inet_pton(AF_INET6, ml_eid_str, &ml_eid) != 1) {
+        ESP_LOGE(TAG, "Invalid ML-EID address format: %s", ml_eid_str);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Check if device already registered - update if found
+    for (int i = 0; i < MAX_REGISTERED_DEVICES; i++) {
+        if (s_device_registry[i].in_use && 
+            memcmp(s_device_registry[i].ext_mac, mac_bytes, 8) == 0) {
+            // Update existing entry
+            memcpy(&s_device_registry[i].ml_eid, &ml_eid, sizeof(struct in6_addr));
+            s_device_registry[i].last_seen = xTaskGetTickCount();
+            ESP_LOGI(TAG, "Updated device registry: MAC=%s, ML-EID=%s", ext_mac, ml_eid_str);
+            return ESP_OK;
+        }
+    }
+
+    // Find empty slot for new registration
+    for (int i = 0; i < MAX_REGISTERED_DEVICES; i++) {
+        if (!s_device_registry[i].in_use) {
+            memcpy(s_device_registry[i].ext_mac, mac_bytes, 8);
+            memcpy(&s_device_registry[i].ml_eid, &ml_eid, sizeof(struct in6_addr));
+            s_device_registry[i].in_use = true;
+            s_device_registry[i].last_seen = xTaskGetTickCount();
+            ESP_LOGI(TAG, "Registered new device: MAC=%s, ML-EID=%s", ext_mac, ml_eid_str);
+            return ESP_OK;
+        }
+    }
+
+    ESP_LOGW(TAG, "Device registry full, cannot register MAC=%s", ext_mac);
+    return ESP_ERR_NO_MEM;
+}
+
+/**
+ * @brief Look up ML-EID for a device in the registry
+ */
+static esp_err_t lookup_device_ml_eid(const uint8_t *ext_mac, struct in6_addr *ml_eid)
+{
+    for (int i = 0; i < MAX_REGISTERED_DEVICES; i++) {
+        if (s_device_registry[i].in_use && 
+            memcmp(s_device_registry[i].ext_mac, ext_mac, 8) == 0) {
+            memcpy(ml_eid, &s_device_registry[i].ml_eid, sizeof(struct in6_addr));
+            s_device_registry[i].last_seen = xTaskGetTickCount();
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+/**
  * @brief Find IPv6 address of device by extended MAC in neighbor table
  */
 static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6_addr)
@@ -370,14 +485,29 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Iterate through neighbor table
+    // First check device registry for ML-EID
+    struct in6_addr ml_eid;
+    if (lookup_device_ml_eid(target_mac, &ml_eid) == ESP_OK) {
+        // Use registered ML-EID (stable address)
+        memcpy(ipv6_addr->mFields.m8, &ml_eid, sizeof(struct in6_addr));
+        
+        char ipv6_str[OT_IP6_ADDRESS_STRING_SIZE];
+        otIp6AddressToString(ipv6_addr, ipv6_str, sizeof(ipv6_str));
+        ESP_LOGI(TAG, "Using registered ML-EID for device %s: %s", ext_mac, ipv6_str);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Device %s not in registry, checking neighbor table for RLOC16", ext_mac);
+
+    // Fallback: Iterate through neighbor table for RLOC16-based address
     otNeighborInfoIterator iterator = OT_NEIGHBOR_INFO_ITERATOR_INIT;
     otNeighborInfo neighbor_info;
 
     while (otThreadGetNextNeighborInfo(instance, &iterator, &neighbor_info) == OT_ERROR_NONE) {
         // Compare extended MAC addresses
         if (memcmp(neighbor_info.mExtAddress.m8, target_mac, 8) == 0) {
-            // Found the device - get its RLOC16 and derive mesh-local IPv6
+            // Found the device - use RLOC16-based mesh-local address
+            // Note: This is less stable than ML-EID and may change
             uint16_t rloc16 = neighbor_info.mRloc16;
             
             // Get mesh-local prefix
@@ -387,7 +517,7 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
                 return ESP_FAIL;
             }
 
-            // Construct mesh-local IPv6 address
+            // Construct RLOC16-based mesh-local IPv6 address
             memcpy(ipv6_addr->mFields.m8, ml_prefix->m8, 8);
             ipv6_addr->mFields.m8[8] = 0x00;
             ipv6_addr->mFields.m8[9] = 0x00;
@@ -400,7 +530,8 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
 
             char ipv6_str[OT_IP6_ADDRESS_STRING_SIZE];
             otIp6AddressToString(ipv6_addr, ipv6_str, sizeof(ipv6_str));
-            ESP_LOGI(TAG, "Found device %s at RLOC16 0x%04x, IPv6: %s", ext_mac, rloc16, ipv6_str);
+            ESP_LOGW(TAG, "Device %s not registered - using unstable RLOC16 address: %s", ext_mac, ipv6_str);
+            ESP_LOGW(TAG, "Please register device to use stable ML-EID addressing");
             
             return ESP_OK;
         }
@@ -500,25 +631,27 @@ esp_err_t esp_ot_mqtt_publish_neighbor_table(void)
                 neighbor_info.mExtAddress.m8[4], neighbor_info.mExtAddress.m8[5],
                 neighbor_info.mExtAddress.m8[6], neighbor_info.mExtAddress.m8[7]);
 
-        // Construct mesh-local IPv6
-        otIp6Address ipv6_addr;
+        // Construct RLOC16-based mesh-local address
+        // Note: Devices also have ML-EID addresses, but we can't derive them
+        // from Extended MAC (OpenThread uses hash-based IID for ML-EID)
+        otIp6Address rloc_addr;
         const otMeshLocalPrefix *ml_prefix = otThreadGetMeshLocalPrefix(instance);
         if (ml_prefix) {
-            memcpy(ipv6_addr.mFields.m8, ml_prefix->m8, 8);
-            ipv6_addr.mFields.m8[8] = 0x00;
-            ipv6_addr.mFields.m8[9] = 0x00;
-            ipv6_addr.mFields.m8[10] = 0x00;
-            ipv6_addr.mFields.m8[11] = 0xff;
-            ipv6_addr.mFields.m8[12] = 0xfe;
-            ipv6_addr.mFields.m8[13] = 0x00;
-            ipv6_addr.mFields.m8[14] = (uint8_t)(neighbor_info.mRloc16 >> 8);
-            ipv6_addr.mFields.m8[15] = (uint8_t)(neighbor_info.mRloc16 & 0xff);
+            memcpy(rloc_addr.mFields.m8, ml_prefix->m8, 8);
+            rloc_addr.mFields.m8[8] = 0x00;
+            rloc_addr.mFields.m8[9] = 0x00;
+            rloc_addr.mFields.m8[10] = 0x00;
+            rloc_addr.mFields.m8[11] = 0xff;
+            rloc_addr.mFields.m8[12] = 0xfe;
+            rloc_addr.mFields.m8[13] = 0x00;
+            rloc_addr.mFields.m8[14] = (uint8_t)(neighbor_info.mRloc16 >> 8);
+            rloc_addr.mFields.m8[15] = (uint8_t)(neighbor_info.mRloc16 & 0xff);
 
-            char ipv6_str[OT_IP6_ADDRESS_STRING_SIZE];
-            otIp6AddressToString(&ipv6_addr, ipv6_str, sizeof(ipv6_str));
+            char rloc_str[OT_IP6_ADDRESS_STRING_SIZE];
+            otIp6AddressToString(&rloc_addr, rloc_str, sizeof(rloc_str));
 
             cJSON_AddStringToObject(neighbor_obj, "mac", mac_str);
-            cJSON_AddStringToObject(neighbor_obj, "ipv6", ipv6_str);
+            cJSON_AddStringToObject(neighbor_obj, "ipv6", rloc_str);
             cJSON_AddNumberToObject(neighbor_obj, "rloc16", neighbor_info.mRloc16);
             cJSON_AddNumberToObject(neighbor_obj, "age", neighbor_info.mAge);
             cJSON_AddNumberToObject(neighbor_obj, "linkQuality", neighbor_info.mLinkQualityIn);

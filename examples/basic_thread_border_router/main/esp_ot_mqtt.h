@@ -109,6 +109,23 @@ esp_err_t esp_ot_mqtt_publish_br_status(void);
 esp_err_t esp_ot_mqtt_send_to_device(const char *ext_mac, const char *payload, size_t payload_len);
 
 /**
+ * @brief Register a Thread device's ML-EID address
+ *
+ * This function registers the stable ML-EID address for a Thread device,
+ * allowing messages to be routed using the stable address instead of the
+ * RLOC16-based address which can change.
+ *
+ * Thread devices should call this when they join the network and send:
+ * MQTT topic: <base_topic>/cmd/register
+ * JSON payload: {"mac":"ca7bf088c6e9bb2a", "ml_eid":"fd64:f0dd:8948:b4b1:4d0e:fbfa:552f:b1cd"}
+ *
+ * @param ext_mac Extended MAC address as hex string (e.g., "ca7bf088c6e9bb2a")
+ * @param ml_eid_str ML-EID IPv6 address as string (e.g., "fd64:f0dd:8948:b4b1:4d0e:fbfa:552f:b1cd")
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t esp_ot_mqtt_register_device(const char *ext_mac, const char *ml_eid_str);
+
+/**
  * @brief Get list of neighbor devices and publish to MQTT
  *
  * Queries the Thread neighbor table and publishes the list of devices
