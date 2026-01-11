@@ -24,6 +24,7 @@
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "esp_crt_bundle.h"
 
 static const char *TAG = "esp_ot_mqtt";
 
@@ -165,6 +166,13 @@ esp_err_t esp_ot_mqtt_init(const esp_ot_mqtt_config_t *config)
         .session.last_will.qos = 1,
         .session.last_will.retain = 1,
     };
+
+    // Configure TLS if using mqtts://
+    if (config->use_global_ca_store) {
+        mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+        mqtt_cfg.broker.verification.skip_cert_common_name_check = false;
+        ESP_LOGI(TAG, "TLS enabled with certificate bundle verification");
+    }
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     if (s_mqtt_client == NULL) {

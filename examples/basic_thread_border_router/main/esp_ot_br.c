@@ -126,6 +126,7 @@ void app_main(void)
         .password = MQTT_PASSWORD,
         .base_topic = MQTT_BASE_TOPIC,
         .udp_port = MQTT_UDP_PORT,
+        .use_global_ca_store = MQTT_USE_GLOBAL_CA_STORE,
     };
     
     esp_err_t mqtt_ret = esp_ot_mqtt_init(&mqtt_config);

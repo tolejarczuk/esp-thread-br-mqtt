@@ -16,12 +16,13 @@ extern "C" {
  * @brief MQTT configuration structure
  */
 typedef struct {
-    const char *broker_uri;      /*!< MQTT broker URI (e.g., mqtt://broker.example.com:1883) */
+    const char *broker_uri;      /*!< MQTT broker URI (e.g., mqtt://broker.example.com:1883 or mqtts://broker.example.com:8883) */
     const char *client_id;       /*!< MQTT client ID */
     const char *username;        /*!< MQTT username (optional, can be NULL) */
     const char *password;        /*!< MQTT password (optional, can be NULL) */
     const char *base_topic;      /*!< Base topic prefix for publishing (e.g., "esp-ot-br") */
     uint16_t udp_port;           /*!< UDP port for sending messages to Thread devices (default: 12345) */
+    bool use_global_ca_store;    /*!< Use ESP-IDF certificate bundle for TLS verification (recommended for mqtts://) */
 } esp_ot_mqtt_config_t;
 
 /**
