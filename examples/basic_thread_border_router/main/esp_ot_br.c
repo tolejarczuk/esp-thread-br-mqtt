@@ -17,6 +17,8 @@
 #include "esp_openthread_border_router.h"
 #include "esp_openthread_types.h"
 #include "esp_ot_config.h"
+#include "esp_ot_mqtt.h"
+#include "mqtt_credentials.h"
 #include "esp_ot_ota_commands.h"
 #include "esp_ot_wifi_cmd.h"
 #include "esp_spiffs.h"
@@ -115,6 +117,25 @@ void app_main(void)
 #if CONFIG_OPENTHREAD_BR_START_WEB
     esp_br_web_start("/spiffs");
 #endif
+
+    // Initialize MQTT client
+    esp_ot_mqtt_config_t mqtt_config = {
+        .broker_uri = MQTT_BROKER_URI,
+        .client_id = MQTT_CLIENT_ID,
+        .username = MQTT_USERNAME,
+        .password = MQTT_PASSWORD,
+        .base_topic = MQTT_BASE_TOPIC,
+        .udp_port = MQTT_UDP_PORT,
+    };
+    
+    esp_err_t mqtt_ret = esp_ot_mqtt_init(&mqtt_config);
+    if (mqtt_ret == ESP_OK) {
+        ESP_LOGI(TAG, "MQTT initialized successfully");
+        ESP_LOGI(TAG, "Subscribe to topic: %s/cmd/device", mqtt_config.base_topic);
+        ESP_LOGI(TAG, "Send JSON: {\"mac\":\"001122334455aabb\",\"payload\":\"your_message\"}");
+    } else {
+        ESP_LOGW(TAG, "MQTT initialization failed, continuing without MQTT");
+    }
 
     launch_openthread_border_router(&platform_config, &rcp_update_config);
 }
