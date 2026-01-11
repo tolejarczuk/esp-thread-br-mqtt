@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "esp_ot_mqtt.h"
+#include "mqtt_credentials.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -547,9 +548,9 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
         esp_mqtt_client_publish(s_mqtt_client, request_topic, request_msg, 0, 1, 0);
         ESP_LOGI(TAG, "Published ML-EID request for device %s, waiting for response...", ext_mac);
         
-        // Wait for response (max 5 seconds)
+        // Wait for response (timeout from config)
         if (s_ml_eid_response_sem) {
-            if (xSemaphoreTake(s_ml_eid_response_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            if (xSemaphoreTake(s_ml_eid_response_sem, pdMS_TO_TICKS(MQTT_ML_EID_REQUEST_TIMEOUT_MS)) == pdTRUE) {
                 ESP_LOGI(TAG, "Received ML-EID response, retrying lookup");
                 // Retry lookup after receiving response
                 if (lookup_device_ml_eid(target_mac, &ml_eid) == ESP_OK) {
