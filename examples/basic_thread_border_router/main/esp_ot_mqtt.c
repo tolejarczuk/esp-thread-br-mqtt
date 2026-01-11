@@ -34,7 +34,7 @@
 static const char *TAG = "esp_ot_mqtt";
 
 // Device registry for Extended MAC to ML-EID mapping
-#define MAX_REGISTERED_DEVICES 32
+#define MAX_REGISTERED_DEVICES MQTT_MAX_REGISTERED_DEVICES
 
 typedef struct {
     uint8_t ext_mac[8];           // Extended MAC address
