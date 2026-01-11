@@ -28,6 +28,7 @@
 #include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "esp_ot_mqtt";
 
@@ -47,6 +48,11 @@ static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static char s_base_topic[128] = {0};
 static bool s_mqtt_connected = false;
 static uint16_t s_udp_port = 12345;  // Default UDP port for device communication
+
+// ML-EID request state
+static SemaphoreHandle_t s_ml_eid_response_sem = NULL;
+static char s_pending_mac_request[17] = {0};
+static bool s_ml_eid_request_pending = false;
 
 /**
  * @brief MQTT event handler
@@ -117,11 +123,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 mac->valuestring, ml_eid->valuestring);
                         esp_err_t ret = esp_ot_mqtt_register_device(mac->valuestring, ml_eid->valuestring);
                         if (ret == ESP_OK) {
-                            // Publish registration confirmation
-                            char confirm_topic[256];
-                            snprintf(confirm_topic, sizeof(confirm_topic), "%s/status/registered", s_base_topic);
-                            esp_mqtt_client_publish(client, confirm_topic, mac->valuestring, 0, 1, 0);
                             ESP_LOGI(TAG, "Device registered successfully");
+                            
+                            // Check if this is a response to our ML-EID request
+                            if (s_ml_eid_request_pending && 
+                                strcmp(s_pending_mac_request, mac->valuestring) == 0) {
+                                // Signal that we received the ML-EID response
+                                s_ml_eid_request_pending = false;
+                                if (s_ml_eid_response_sem) {
+                                    xSemaphoreGive(s_ml_eid_response_sem);
+                                }
+                            }
                         } else {
                             ESP_LOGW(TAG, "Failed to register device");
                         }
@@ -196,6 +208,15 @@ esp_err_t esp_ot_mqtt_init(const esp_ot_mqtt_config_t *config)
     if (s_mqtt_client != NULL) {
         ESP_LOGW(TAG, "MQTT client already initialized");
         return ESP_OK;
+    }
+
+    // Create semaphore for ML-EID request synchronization
+    if (s_ml_eid_response_sem == NULL) {
+        s_ml_eid_response_sem = xSemaphoreCreateBinary();
+        if (s_ml_eid_response_sem == NULL) {
+            ESP_LOGE(TAG, "Failed to create ML-EID response semaphore");
+            return ESP_FAIL;
+        }
     }
 
     // Store base topic and UDP port
@@ -443,6 +464,19 @@ esp_err_t esp_ot_mqtt_register_device(const char *ext_mac, const char *ml_eid_st
             s_device_registry[i].in_use = true;
             s_device_registry[i].last_seen = xTaskGetTickCount();
             ESP_LOGI(TAG, "Registered new device: MAC=%s, ML-EID=%s", ext_mac, ml_eid_str);
+            
+            // Publish device registration notification
+            if (s_mqtt_client && s_mqtt_connected) {
+                char notify_topic[256];
+                char notify_msg[512];
+                snprintf(notify_topic, sizeof(notify_topic), "%s/notify/device_registered", s_base_topic);
+                snprintf(notify_msg, sizeof(notify_msg), 
+                        "{\"mac\":\"%s\",\"ml_eid\":\"%s\",\"timestamp\":%lu}",
+                        ext_mac, ml_eid_str, (unsigned long)xTaskGetTickCount());
+                esp_mqtt_client_publish(s_mqtt_client, notify_topic, notify_msg, 0, 1, 0);
+                ESP_LOGI(TAG, "Published device registration notification");
+            }
+            
             return ESP_OK;
         }
     }
@@ -495,6 +529,41 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
         otIp6AddressToString(ipv6_addr, ipv6_str, sizeof(ipv6_str));
         ESP_LOGI(TAG, "Using registered ML-EID for device %s: %s", ext_mac, ipv6_str);
         return ESP_OK;
+    }
+
+    // Device not in registry - request ML-EID from backend
+    if (s_mqtt_client && s_mqtt_connected && !s_ml_eid_request_pending) {
+        ESP_LOGI(TAG, "Device %s not in registry, requesting ML-EID from backend", ext_mac);
+        
+        // Mark request as pending
+        s_ml_eid_request_pending = true;
+        snprintf(s_pending_mac_request, sizeof(s_pending_mac_request), "%s", ext_mac);
+        
+        // Publish ML-EID request
+        char request_topic[256];
+        char request_msg[256];
+        snprintf(request_topic, sizeof(request_topic), "%s/request/ml_eid", s_base_topic);
+        snprintf(request_msg, sizeof(request_msg), "{\"mac\":\"%s\"}", ext_mac);
+        esp_mqtt_client_publish(s_mqtt_client, request_topic, request_msg, 0, 1, 0);
+        ESP_LOGI(TAG, "Published ML-EID request for device %s, waiting for response...", ext_mac);
+        
+        // Wait for response (max 5 seconds)
+        if (s_ml_eid_response_sem) {
+            if (xSemaphoreTake(s_ml_eid_response_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                ESP_LOGI(TAG, "Received ML-EID response, retrying lookup");
+                // Retry lookup after receiving response
+                if (lookup_device_ml_eid(target_mac, &ml_eid) == ESP_OK) {
+                    memcpy(ipv6_addr->mFields.m8, &ml_eid, sizeof(struct in6_addr));
+                    char ipv6_str[OT_IP6_ADDRESS_STRING_SIZE];
+                    otIp6AddressToString(ipv6_addr, ipv6_str, sizeof(ipv6_str));
+                    ESP_LOGI(TAG, "Using ML-EID from backend response: %s", ipv6_str);
+                    return ESP_OK;
+                }
+            } else {
+                ESP_LOGW(TAG, "ML-EID request timeout, falling back to RLOC16");
+                s_ml_eid_request_pending = false;
+            }
+        }
     }
 
     ESP_LOGI(TAG, "Device %s not in registry, checking neighbor table for RLOC16", ext_mac);
