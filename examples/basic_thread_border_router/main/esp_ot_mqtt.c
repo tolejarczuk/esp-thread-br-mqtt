@@ -6,30 +6,30 @@
 #include "esp_ot_mqtt.h"
 #include "mqtt_credentials.h"
 
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
-#include "esp_log.h"
+#include "cJSON.h"
+#include "esp_crt_bundle.h"
 #include "esp_event.h"
-#include "mqtt_client.h"
+#include "esp_log.h"
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_openthread_netif_glue.h"
-#include "openthread/instance.h"
-#include "openthread/thread.h"
-#include "openthread/dataset.h"
-#include "openthread/thread_ftd.h"
-#include "openthread/ip6.h"
-#include "openthread/udp.h"
-#include "openthread/message.h"
-#include "openthread/link.h"
-#include "cJSON.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
-#include "esp_crt_bundle.h"
+#include "mqtt_client.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+#include "openthread/dataset.h"
+#include "openthread/instance.h"
+#include "openthread/ip6.h"
+#include "openthread/link.h"
+#include "openthread/message.h"
+#include "openthread/thread.h"
+#include "openthread/thread_ftd.h"
+#include "openthread/udp.h"
 
 static const char *TAG = "esp_ot_mqtt";
 
@@ -37,10 +37,10 @@ static const char *TAG = "esp_ot_mqtt";
 #define MAX_REGISTERED_DEVICES MQTT_MAX_REGISTERED_DEVICES
 
 typedef struct {
-    uint8_t ext_mac[8];           // Extended MAC address
-    struct in6_addr ml_eid;       // ML-EID IPv6 address
-    bool in_use;                  // Is this entry active?
-    uint32_t last_seen;           // Timestamp of last registration/activity
+    uint8_t ext_mac[8];     // Extended MAC address
+    struct in6_addr ml_eid; // ML-EID IPv6 address
+    bool in_use;            // Is this entry active?
+    uint32_t last_seen;     // Timestamp of last registration/activity
 } device_registry_entry_t;
 
 static device_registry_entry_t s_device_registry[MAX_REGISTERED_DEVICES];
@@ -48,7 +48,7 @@ static device_registry_entry_t s_device_registry[MAX_REGISTERED_DEVICES];
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static char s_base_topic[128] = {0};
 static bool s_mqtt_connected = false;
-static uint16_t s_udp_port = 12345;  // Default UDP port for device communication
+static uint16_t s_udp_port = 12345; // Default UDP port for device communication
 
 // ML-EID request state
 static SemaphoreHandle_t s_ml_eid_response_sem = NULL;
@@ -62,24 +62,24 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 {
     esp_mqtt_event_handle_t event = event_data;
     esp_mqtt_client_handle_t client = event->client;
-    
+
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         s_mqtt_connected = true;
-        
+
         // Auto-subscribe to command topics
         char cmd_topic[256];
         snprintf(cmd_topic, sizeof(cmd_topic), "%s/cmd/#", s_base_topic);
         esp_mqtt_client_subscribe(client, cmd_topic, 1);
         ESP_LOGI(TAG, "Subscribed to %s", cmd_topic);
-        
+
         // Publish online status
         char status_topic[256];
         snprintf(status_topic, sizeof(status_topic), "%s/status", s_base_topic);
         esp_mqtt_client_publish(client, status_topic, "online", 0, 1, 1);
         break;
-        
+
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
         s_mqtt_connected = false;
@@ -88,28 +88,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
         break;
-        
+
     case MQTT_EVENT_UNSUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
         break;
-        
+
     case MQTT_EVENT_PUBLISHED:
         ESP_LOGD(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
         break;
-        
+
     case MQTT_EVENT_DATA:
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
         ESP_LOGI(TAG, "DATA=%.*s", event->data_len, event->data);
-        
+
         // Check if this is a device message command
         char topic_str[256] = {0};
         snprintf(topic_str, sizeof(topic_str), "%.*s", event->topic_len, event->topic);
-        
+
         // Check for device registration messages
         char register_topic[256];
         snprintf(register_topic, sizeof(register_topic), "%s/cmd/register", s_base_topic);
-        
+
         if (strstr(topic_str, register_topic) != NULL) {
             // Parse JSON: {"mac":"ca7bf088c6e9bb2a", "ml_eid":"fd64:f0dd:8948:b4b1:4d0e:fbfa:552f:b1cd"}
             char *data_copy = strndup(event->data, event->data_len);
@@ -118,17 +118,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 if (json) {
                     cJSON *mac = cJSON_GetObjectItem(json, "mac");
                     cJSON *ml_eid = cJSON_GetObjectItem(json, "ml_eid");
-                    
+
                     if (cJSON_IsString(mac) && cJSON_IsString(ml_eid)) {
-                        ESP_LOGI(TAG, "Device registration: MAC=%s, ML-EID=%s", 
-                                mac->valuestring, ml_eid->valuestring);
+                        ESP_LOGI(TAG, "Device registration: MAC=%s, ML-EID=%s", mac->valuestring, ml_eid->valuestring);
                         esp_err_t ret = esp_ot_mqtt_register_device(mac->valuestring, ml_eid->valuestring);
                         if (ret == ESP_OK) {
                             ESP_LOGI(TAG, "Device registered successfully");
-                            
+
                             // Check if this is a response to our ML-EID request
-                            if (s_ml_eid_request_pending && 
-                                strcmp(s_pending_mac_request, mac->valuestring) == 0) {
+                            if (s_ml_eid_request_pending && strcmp(s_pending_mac_request, mac->valuestring) == 0) {
                                 // Signal that we received the ML-EID response
                                 s_ml_eid_request_pending = false;
                                 if (s_ml_eid_response_sem) {
@@ -144,10 +142,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 free(data_copy);
             }
         }
-        
+
         char device_cmd_topic[256];
         snprintf(device_cmd_topic, sizeof(device_cmd_topic), "%s/cmd/device", s_base_topic);
-        
+
         if (strstr(topic_str, device_cmd_topic) != NULL) {
             // Parse JSON message: {"mac":"001122334455aabb", "payload":"data"}
             char *data_copy = strndup(event->data, event->data_len);
@@ -156,11 +154,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 if (json) {
                     cJSON *mac = cJSON_GetObjectItem(json, "mac");
                     cJSON *payload = cJSON_GetObjectItem(json, "payload");
-                    
+
                     if (cJSON_IsString(mac) && cJSON_IsString(payload)) {
                         ESP_LOGI(TAG, "Routing message to device MAC: %s", mac->valuestring);
-                        esp_err_t ret = esp_ot_mqtt_send_to_device(mac->valuestring, 
-                                                                   payload->valuestring, 
+                        esp_err_t ret = esp_ot_mqtt_send_to_device(mac->valuestring, payload->valuestring,
                                                                    strlen(payload->valuestring));
                         if (ret == ESP_OK) {
                             ESP_LOGI(TAG, "Message sent to device successfully");
@@ -178,13 +175,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             }
         }
         break;
-        
+
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
         if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
             ESP_LOGE(TAG, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
             ESP_LOGE(TAG, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
-            ESP_LOGE(TAG, "Last captured errno : %d (%s)",  event->error_handle->esp_transport_sock_errno,
+            ESP_LOGE(TAG, "Last captured errno : %d (%s)", event->error_handle->esp_transport_sock_errno,
                      strerror(event->error_handle->esp_transport_sock_errno));
         } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
             ESP_LOGE(TAG, "Connection refused error: 0x%x", event->error_handle->connect_return_code);
@@ -192,7 +189,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGW(TAG, "Unknown error type: 0x%x", event->error_handle->error_type);
         }
         break;
-        
+
     default:
         ESP_LOGD(TAG, "Other event id:%d", event->event_id);
         break;
@@ -375,20 +372,29 @@ esp_err_t esp_ot_mqtt_publish_br_status(void)
     otDeviceRole role = otThreadGetDeviceRole(instance);
     const char *role_str = "unknown";
     switch (role) {
-        case OT_DEVICE_ROLE_DISABLED: role_str = "disabled"; break;
-        case OT_DEVICE_ROLE_DETACHED: role_str = "detached"; break;
-        case OT_DEVICE_ROLE_CHILD: role_str = "child"; break;
-        case OT_DEVICE_ROLE_ROUTER: role_str = "router"; break;
-        case OT_DEVICE_ROLE_LEADER: role_str = "leader"; break;
-        default: break;
+    case OT_DEVICE_ROLE_DISABLED:
+        role_str = "disabled";
+        break;
+    case OT_DEVICE_ROLE_DETACHED:
+        role_str = "detached";
+        break;
+    case OT_DEVICE_ROLE_CHILD:
+        role_str = "child";
+        break;
+    case OT_DEVICE_ROLE_ROUTER:
+        role_str = "router";
+        break;
+    case OT_DEVICE_ROLE_LEADER:
+        role_str = "leader";
+        break;
+    default:
+        break;
     }
 
     // Build JSON status message
     char status_msg[512];
-    int len = snprintf(status_msg, sizeof(status_msg),
-                      "{\"role\":\"%s\",\"rloc16\":\"0x%04x\"}",
-                      role_str,
-                      otThreadGetRloc16(instance));
+    int len = snprintf(status_msg, sizeof(status_msg), "{\"role\":\"%s\",\"rloc16\":\"0x%04x\"}", role_str,
+                       otThreadGetRloc16(instance));
 
     // Publish status
     esp_ot_mqtt_publish("thread/status", status_msg, len, 1, 0);
@@ -447,8 +453,7 @@ esp_err_t esp_ot_mqtt_register_device(const char *ext_mac, const char *ml_eid_st
 
     // Check if device already registered - update if found
     for (int i = 0; i < MAX_REGISTERED_DEVICES; i++) {
-        if (s_device_registry[i].in_use && 
-            memcmp(s_device_registry[i].ext_mac, mac_bytes, 8) == 0) {
+        if (s_device_registry[i].in_use && memcmp(s_device_registry[i].ext_mac, mac_bytes, 8) == 0) {
             // Update existing entry
             memcpy(&s_device_registry[i].ml_eid, &ml_eid, sizeof(struct in6_addr));
             s_device_registry[i].last_seen = xTaskGetTickCount();
@@ -465,19 +470,18 @@ esp_err_t esp_ot_mqtt_register_device(const char *ext_mac, const char *ml_eid_st
             s_device_registry[i].in_use = true;
             s_device_registry[i].last_seen = xTaskGetTickCount();
             ESP_LOGI(TAG, "Registered new device: MAC=%s, ML-EID=%s", ext_mac, ml_eid_str);
-            
+
             // Publish device registration notification
             if (s_mqtt_client && s_mqtt_connected) {
                 char notify_topic[256];
                 char notify_msg[512];
                 snprintf(notify_topic, sizeof(notify_topic), "%s/notify/device_registered", s_base_topic);
-                snprintf(notify_msg, sizeof(notify_msg), 
-                        "{\"mac\":\"%s\",\"ml_eid\":\"%s\",\"timestamp\":%lu}",
-                        ext_mac, ml_eid_str, (unsigned long)xTaskGetTickCount());
+                snprintf(notify_msg, sizeof(notify_msg), "{\"mac\":\"%s\",\"ml_eid\":\"%s\",\"timestamp\":%lu}",
+                         ext_mac, ml_eid_str, (unsigned long)xTaskGetTickCount());
                 esp_mqtt_client_publish(s_mqtt_client, notify_topic, notify_msg, 0, 1, 0);
                 ESP_LOGI(TAG, "Published device registration notification");
             }
-            
+
             return ESP_OK;
         }
     }
@@ -492,8 +496,7 @@ esp_err_t esp_ot_mqtt_register_device(const char *ext_mac, const char *ml_eid_st
 static esp_err_t lookup_device_ml_eid(const uint8_t *ext_mac, struct in6_addr *ml_eid)
 {
     for (int i = 0; i < MAX_REGISTERED_DEVICES; i++) {
-        if (s_device_registry[i].in_use && 
-            memcmp(s_device_registry[i].ext_mac, ext_mac, 8) == 0) {
+        if (s_device_registry[i].in_use && memcmp(s_device_registry[i].ext_mac, ext_mac, 8) == 0) {
             memcpy(ml_eid, &s_device_registry[i].ml_eid, sizeof(struct in6_addr));
             s_device_registry[i].last_seen = xTaskGetTickCount();
             return ESP_OK;
@@ -525,7 +528,7 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
     if (lookup_device_ml_eid(target_mac, &ml_eid) == ESP_OK) {
         // Use registered ML-EID (stable address)
         memcpy(ipv6_addr->mFields.m8, &ml_eid, sizeof(struct in6_addr));
-        
+
         char ipv6_str[OT_IP6_ADDRESS_STRING_SIZE];
         otIp6AddressToString(ipv6_addr, ipv6_str, sizeof(ipv6_str));
         ESP_LOGI(TAG, "Using registered ML-EID for device %s: %s", ext_mac, ipv6_str);
@@ -535,11 +538,11 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
     // Device not in registry - request ML-EID from backend
     if (s_mqtt_client && s_mqtt_connected && !s_ml_eid_request_pending) {
         ESP_LOGI(TAG, "Device %s not in registry, requesting ML-EID from backend", ext_mac);
-        
+
         // Mark request as pending
         s_ml_eid_request_pending = true;
         snprintf(s_pending_mac_request, sizeof(s_pending_mac_request), "%s", ext_mac);
-        
+
         // Publish ML-EID request
         char request_topic[256];
         char request_msg[256];
@@ -547,7 +550,7 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
         snprintf(request_msg, sizeof(request_msg), "{\"mac\":\"%s\"}", ext_mac);
         esp_mqtt_client_publish(s_mqtt_client, request_topic, request_msg, 0, 1, 0);
         ESP_LOGI(TAG, "Published ML-EID request for device %s, waiting for response...", ext_mac);
-        
+
         // Wait for response (timeout from config)
         if (s_ml_eid_response_sem) {
             if (xSemaphoreTake(s_ml_eid_response_sem, pdMS_TO_TICKS(MQTT_ML_EID_REQUEST_TIMEOUT_MS)) == pdTRUE) {
@@ -579,7 +582,7 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
             // Found the device - use RLOC16-based mesh-local address
             // Note: This is less stable than ML-EID and may change
             uint16_t rloc16 = neighbor_info.mRloc16;
-            
+
             // Get mesh-local prefix
             const otMeshLocalPrefix *ml_prefix = otThreadGetMeshLocalPrefix(instance);
             if (ml_prefix == NULL) {
@@ -602,63 +605,62 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
             otIp6AddressToString(ipv6_addr, ipv6_str, sizeof(ipv6_str));
             ESP_LOGW(TAG, "Device %s not registered - using unstable RLOC16 address: %s", ext_mac, ipv6_str);
             ESP_LOGI(TAG, "Will request ML-EID from device via UDP");
-            
+
             // Request ML-EID directly from device via UDP
             int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
             if (sock >= 0) {
                 // Set receive timeout
                 struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                
+
                 // Bind to any port for receiving
                 struct sockaddr_in6 bind_addr = {0};
                 bind_addr.sin6_family = AF_INET6;
-                bind_addr.sin6_port = 0;  // Any port
+                bind_addr.sin6_port = 0; // Any port
                 bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
-                
+
                 // Send ML-EID request to device
                 struct sockaddr_in6 dest_addr = {0};
                 dest_addr.sin6_family = AF_INET6;
                 dest_addr.sin6_port = htons(s_udp_port);
                 memcpy(&dest_addr.sin6_addr, ipv6_addr->mFields.m8, 16);
-                
+
                 const char *ml_eid_req = "GET_MLEID";
-                sendto(sock, ml_eid_req, strlen(ml_eid_req), 0, 
-                      (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+                sendto(sock, ml_eid_req, strlen(ml_eid_req), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
                 ESP_LOGI(TAG, "Sent ML-EID request to device");
-                
+
                 // Wait for response
                 char response[128];
                 struct sockaddr_in6 src_addr;
                 socklen_t src_len = sizeof(src_addr);
-                int recv_len = recvfrom(sock, response, sizeof(response) - 1, 0,
-                                       (struct sockaddr *)&src_addr, &src_len);
-                
+                int recv_len =
+                    recvfrom(sock, response, sizeof(response) - 1, 0, (struct sockaddr *)&src_addr, &src_len);
+
                 if (recv_len > 0) {
                     response[recv_len] = '\0';
                     ESP_LOGI(TAG, "Received response from device: %s", response);
-                    
+
                     // Parse ML-EID from response (format: "MLEID:fd64:f0dd:...")
                     if (strncmp(response, "MLEID:", 6) == 0) {
                         char *ml_eid_str = response + 6;
-                        
+
                         // Register the ML-EID
                         if (esp_ot_mqtt_register_device(ext_mac, ml_eid_str) == ESP_OK) {
                             ESP_LOGI(TAG, "Registered ML-EID from device response");
-                            
+
                             // Notify backend
                             if (s_mqtt_client && s_mqtt_connected) {
                                 char notify_topic[256];
                                 char notify_msg[512];
-                                snprintf(notify_topic, sizeof(notify_topic), 
-                                        "%s/notify/device_registered", s_base_topic);
-                                snprintf(notify_msg, sizeof(notify_msg), 
-                                        "{\"mac\":\"%s\",\"ml_eid\":\"%s\",\"source\":\"device\"}",
-                                        ext_mac, ml_eid_str);
+                                snprintf(notify_topic, sizeof(notify_topic), "%s/notify/device_registered",
+                                         s_base_topic);
+                                snprintf(notify_msg, sizeof(notify_msg),
+                                         "{\"mac\":\"%s\",\"ml_eid\":\"%s\",\"source\":\"device\"}", ext_mac,
+                                         ml_eid_str);
                                 esp_mqtt_client_publish(s_mqtt_client, notify_topic, notify_msg, 0, 1, 0);
                                 ESP_LOGI(TAG, "Notified backend of device ML-EID");
                             }
-                            
+
                             // Update ipv6_addr to use the ML-EID
                             struct in6_addr ml_eid_parsed;
                             if (inet_pton(AF_INET6, ml_eid_str, &ml_eid_parsed) == 1) {
@@ -670,10 +672,10 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
                 } else {
                     ESP_LOGW(TAG, "No ML-EID response from device, using RLOC16 address");
                 }
-                
+
                 close(sock);
             }
-            
+
             return ESP_OK;
         }
     }
@@ -712,9 +714,8 @@ esp_err_t esp_ot_mqtt_send_to_device(const char *ext_mac, const char *payload, s
     inet_pton(AF_INET6, ipv6_str, &dest_addr.sin6_addr);
 
     // Send UDP packet
-    int sent_bytes = sendto(sock, payload, payload_len, 0, 
-                           (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    
+    int sent_bytes = sendto(sock, payload, payload_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
     close(sock);
 
     if (sent_bytes < 0) {
@@ -723,13 +724,12 @@ esp_err_t esp_ot_mqtt_send_to_device(const char *ext_mac, const char *payload, s
     }
 
     ESP_LOGI(TAG, "Sent %d bytes to device %s at %s:%d", sent_bytes, ext_mac, ipv6_str, s_udp_port);
-    
+
     // Publish confirmation to MQTT
     if (s_mqtt_connected) {
         char response[256];
-        int resp_len = snprintf(response, sizeof(response),
-                               "{\"mac\":\"%s\",\"status\":\"sent\",\"bytes\":%d}",
-                               ext_mac, sent_bytes);
+        int resp_len = snprintf(response, sizeof(response), "{\"mac\":\"%s\",\"status\":\"sent\",\"bytes\":%d}",
+                                ext_mac, sent_bytes);
         esp_ot_mqtt_publish("device/response", response, resp_len, 1, 0);
     }
 
@@ -766,11 +766,10 @@ esp_err_t esp_ot_mqtt_publish_neighbor_table(void)
 
         // Format extended MAC address
         char mac_str[17];
-        snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x%02x%02x",
-                neighbor_info.mExtAddress.m8[0], neighbor_info.mExtAddress.m8[1],
-                neighbor_info.mExtAddress.m8[2], neighbor_info.mExtAddress.m8[3],
-                neighbor_info.mExtAddress.m8[4], neighbor_info.mExtAddress.m8[5],
-                neighbor_info.mExtAddress.m8[6], neighbor_info.mExtAddress.m8[7]);
+        snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x%02x%02x", neighbor_info.mExtAddress.m8[0],
+                 neighbor_info.mExtAddress.m8[1], neighbor_info.mExtAddress.m8[2], neighbor_info.mExtAddress.m8[3],
+                 neighbor_info.mExtAddress.m8[4], neighbor_info.mExtAddress.m8[5], neighbor_info.mExtAddress.m8[6],
+                 neighbor_info.mExtAddress.m8[7]);
 
         // Construct RLOC16-based mesh-local address
         // Note: Devices also have ML-EID addresses, but we can't derive them

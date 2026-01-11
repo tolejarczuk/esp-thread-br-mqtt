@@ -18,12 +18,12 @@
 #include "esp_openthread_types.h"
 #include "esp_ot_config.h"
 #include "esp_ot_mqtt.h"
-#include "mqtt_credentials.h"
 #include "esp_ot_ota_commands.h"
 #include "esp_ot_wifi_cmd.h"
 #include "esp_spiffs.h"
 #include "esp_vfs_eventfd.h"
 #include "mdns.h"
+#include "mqtt_credentials.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
@@ -128,7 +128,7 @@ void app_main(void)
         .udp_port = MQTT_UDP_PORT,
         .use_global_ca_store = MQTT_USE_GLOBAL_CA_STORE,
     };
-    
+
     esp_err_t mqtt_ret = esp_ot_mqtt_init(&mqtt_config);
     if (mqtt_ret == ESP_OK) {
         ESP_LOGI(TAG, "MQTT initialized successfully");
