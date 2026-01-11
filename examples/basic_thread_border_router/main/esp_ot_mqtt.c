@@ -561,7 +561,7 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
                     return ESP_OK;
                 }
             } else {
-                ESP_LOGW(TAG, "ML-EID request timeout, falling back to RLOC16");
+                ESP_LOGW(TAG, "ML-EID request timeout from backend, will query device directly");
                 s_ml_eid_request_pending = false;
             }
         }
@@ -601,7 +601,78 @@ static esp_err_t find_device_ipv6_by_mac(const char *ext_mac, otIp6Address *ipv6
             char ipv6_str[OT_IP6_ADDRESS_STRING_SIZE];
             otIp6AddressToString(ipv6_addr, ipv6_str, sizeof(ipv6_str));
             ESP_LOGW(TAG, "Device %s not registered - using unstable RLOC16 address: %s", ext_mac, ipv6_str);
-            ESP_LOGW(TAG, "Please register device to use stable ML-EID addressing");
+            ESP_LOGI(TAG, "Will request ML-EID from device via UDP");
+            
+            // Request ML-EID directly from device via UDP
+            int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+            if (sock >= 0) {
+                // Set receive timeout
+                struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                
+                // Bind to any port for receiving
+                struct sockaddr_in6 bind_addr = {0};
+                bind_addr.sin6_family = AF_INET6;
+                bind_addr.sin6_port = 0;  // Any port
+                bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
+                
+                // Send ML-EID request to device
+                struct sockaddr_in6 dest_addr = {0};
+                dest_addr.sin6_family = AF_INET6;
+                dest_addr.sin6_port = htons(s_udp_port);
+                memcpy(&dest_addr.sin6_addr, ipv6_addr->mFields.m8, 16);
+                
+                const char *ml_eid_req = "GET_MLEID";
+                sendto(sock, ml_eid_req, strlen(ml_eid_req), 0, 
+                      (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+                ESP_LOGI(TAG, "Sent ML-EID request to device");
+                
+                // Wait for response
+                char response[128];
+                struct sockaddr_in6 src_addr;
+                socklen_t src_len = sizeof(src_addr);
+                int recv_len = recvfrom(sock, response, sizeof(response) - 1, 0,
+                                       (struct sockaddr *)&src_addr, &src_len);
+                
+                if (recv_len > 0) {
+                    response[recv_len] = '\0';
+                    ESP_LOGI(TAG, "Received response from device: %s", response);
+                    
+                    // Parse ML-EID from response (format: "MLEID:fd64:f0dd:...")
+                    if (strncmp(response, "MLEID:", 6) == 0) {
+                        char *ml_eid_str = response + 6;
+                        
+                        // Register the ML-EID
+                        if (esp_ot_mqtt_register_device(ext_mac, ml_eid_str) == ESP_OK) {
+                            ESP_LOGI(TAG, "Registered ML-EID from device response");
+                            
+                            // Notify backend
+                            if (s_mqtt_client && s_mqtt_connected) {
+                                char notify_topic[256];
+                                char notify_msg[512];
+                                snprintf(notify_topic, sizeof(notify_topic), 
+                                        "%s/notify/device_registered", s_base_topic);
+                                snprintf(notify_msg, sizeof(notify_msg), 
+                                        "{\"mac\":\"%s\",\"ml_eid\":\"%s\",\"source\":\"device\"}",
+                                        ext_mac, ml_eid_str);
+                                esp_mqtt_client_publish(s_mqtt_client, notify_topic, notify_msg, 0, 1, 0);
+                                ESP_LOGI(TAG, "Notified backend of device ML-EID");
+                            }
+                            
+                            // Update ipv6_addr to use the ML-EID
+                            struct in6_addr ml_eid_parsed;
+                            if (inet_pton(AF_INET6, ml_eid_str, &ml_eid_parsed) == 1) {
+                                memcpy(ipv6_addr->mFields.m8, &ml_eid_parsed, 16);
+                                ESP_LOGI(TAG, "Updated to use ML-EID: %s", ml_eid_str);
+                            }
+                        }
+                    }
+                } else {
+                    ESP_LOGW(TAG, "No ML-EID response from device, using RLOC16 address");
+                }
+                
+                close(sock);
+            }
             
             return ESP_OK;
         }
