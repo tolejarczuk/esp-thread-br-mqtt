@@ -55,6 +55,12 @@ static SemaphoreHandle_t s_ml_eid_response_sem = NULL;
 static char s_pending_mac_request[17] = {0};
 static bool s_ml_eid_request_pending = false;
 
+// Forward declarations
+static esp_err_t hex_string_to_bytes(const char *hex_str, uint8_t *bytes, size_t bytes_len);
+static esp_err_t lookup_device_ml_eid(const uint8_t *ext_mac, struct in6_addr *ml_eid);
+static esp_err_t get_device_ml_eid(const char *mac_str, const uint8_t *mac_bytes, char *ml_eid_str,
+                                   size_t ml_eid_str_len);
+
 /**
  * @brief MQTT event handler
  */
@@ -73,6 +79,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         snprintf(cmd_topic, sizeof(cmd_topic), "%s/cmd/#", s_base_topic);
         esp_mqtt_client_subscribe(client, cmd_topic, 1);
         ESP_LOGI(TAG, "Subscribed to %s", cmd_topic);
+
+        // Subscribe to ML-EID request from backend
+        char br_mleid_topic[256];
+        snprintf(br_mleid_topic, sizeof(br_mleid_topic), "%s/br/mleid/request", s_base_topic);
+        esp_mqtt_client_subscribe(client, br_mleid_topic, 1);
+        ESP_LOGI(TAG, "Subscribed to %s", br_mleid_topic);
 
         // Publish online status
         char status_topic[256];
@@ -136,6 +148,47 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         } else {
                             ESP_LOGW(TAG, "Failed to register device");
                         }
+                    }
+                    cJSON_Delete(json);
+                }
+                free(data_copy);
+            }
+        }
+
+        // Check for ML-EID request from backend
+        char br_mleid_request_topic[256];
+        snprintf(br_mleid_request_topic, sizeof(br_mleid_request_topic), "%s/br/mleid/request", s_base_topic);
+
+        if (strstr(topic_str, br_mleid_request_topic) != NULL) {
+            // Parse JSON: {"mac":"ca7bf088c6e9bb2a"}
+            char *data_copy = strndup(event->data, event->data_len);
+            if (data_copy) {
+                cJSON *json = cJSON_Parse(data_copy);
+                if (json) {
+                    cJSON *mac = cJSON_GetObjectItem(json, "mac");
+
+                    if (cJSON_IsString(mac)) {
+                        ESP_LOGI(TAG, "Backend requesting ML-EID for device: %s", mac->valuestring);
+
+                        // Get ML-EID (from registry or query device)
+                        char ml_eid_str[INET6_ADDRSTRLEN] = {0};
+                        esp_err_t result = get_device_ml_eid(mac->valuestring, NULL, ml_eid_str, sizeof(ml_eid_str));
+
+                        // Send response
+                        char response_topic[256];
+                        char response_msg[512];
+                        snprintf(response_topic, sizeof(response_topic), "%s/br/mleid/response", s_base_topic);
+
+                        if (result == ESP_OK) {
+                            snprintf(response_msg, sizeof(response_msg), "{\"mac\":\"%s\",\"ml_eid\":\"%s\"}",
+                                     mac->valuestring, ml_eid_str);
+                        } else {
+                            snprintf(response_msg, sizeof(response_msg), "{\"mac\":\"%s\",\"ml_eid\":null}",
+                                     mac->valuestring);
+                        }
+
+                        esp_mqtt_client_publish(client, response_topic, response_msg, 0, 1, 0);
+                        ESP_LOGI(TAG, "Sent ML-EID response: %s", response_msg);
                     }
                     cJSON_Delete(json);
                 }
@@ -502,6 +555,109 @@ static esp_err_t lookup_device_ml_eid(const uint8_t *ext_mac, struct in6_addr *m
             return ESP_OK;
         }
     }
+    return ESP_ERR_NOT_FOUND;
+}
+
+/**
+ * @brief Get ML-EID for a device (from registry or by querying device)
+ * @param mac_str Extended MAC address string
+ * @param mac_bytes Extended MAC address bytes (optional, can pass NULL to convert from mac_str)
+ * @param ml_eid_str Output buffer for ML-EID string
+ * @param ml_eid_str_len Size of output buffer
+ * @return ESP_OK if ML-EID found, ESP_ERR_NOT_FOUND otherwise
+ */
+static esp_err_t get_device_ml_eid(const char *mac_str, const uint8_t *mac_bytes, char *ml_eid_str,
+                                   size_t ml_eid_str_len)
+{
+    uint8_t mac_bytes_local[8];
+    const uint8_t *mac_ptr = mac_bytes;
+
+    // Convert MAC string if bytes not provided
+    if (mac_ptr == NULL) {
+        if (hex_string_to_bytes(mac_str, mac_bytes_local, 8) != ESP_OK) {
+            ESP_LOGE(TAG, "Invalid MAC address format: %s", mac_str);
+            return ESP_ERR_INVALID_ARG;
+        }
+        mac_ptr = mac_bytes_local;
+    }
+
+    // Check registry first
+    struct in6_addr ml_eid;
+    if (lookup_device_ml_eid(mac_ptr, &ml_eid) == ESP_OK) {
+        inet_ntop(AF_INET6, &ml_eid, ml_eid_str, ml_eid_str_len);
+        ESP_LOGI(TAG, "Found ML-EID in registry: %s", ml_eid_str);
+        return ESP_OK;
+    }
+
+    // Not in registry - try to get from neighbor table and query device
+    ESP_LOGI(TAG, "ML-EID not in registry, attempting device query");
+
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    otNeighborInfoIterator iterator = OT_NEIGHBOR_INFO_ITERATOR_INIT;
+    otNeighborInfo neighbor_info;
+
+    while (otThreadGetNextNeighborInfo(instance, &iterator, &neighbor_info) == OT_ERROR_NONE) {
+        if (memcmp(neighbor_info.mExtAddress.m8, mac_ptr, 8) == 0) {
+            // Found device - try to query for ML-EID via UDP
+            const otMeshLocalPrefix *ml_prefix = otThreadGetMeshLocalPrefix(instance);
+
+            if (ml_prefix) {
+                // Construct RLOC16 address
+                otIp6Address rloc_addr;
+                memcpy(rloc_addr.mFields.m8, ml_prefix->m8, 8);
+                rloc_addr.mFields.m8[8] = 0x00;
+                rloc_addr.mFields.m8[9] = 0x00;
+                rloc_addr.mFields.m8[10] = 0x00;
+                rloc_addr.mFields.m8[11] = 0xff;
+                rloc_addr.mFields.m8[12] = 0xfe;
+                rloc_addr.mFields.m8[13] = 0x00;
+                rloc_addr.mFields.m8[14] = (uint8_t)(neighbor_info.mRloc16 >> 8);
+                rloc_addr.mFields.m8[15] = (uint8_t)(neighbor_info.mRloc16 & 0xff);
+
+                // Query device for ML-EID
+                int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+                if (sock >= 0) {
+                    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                    struct sockaddr_in6 dest_addr = {0};
+                    dest_addr.sin6_family = AF_INET6;
+                    dest_addr.sin6_port = htons(s_udp_port);
+                    memcpy(&dest_addr.sin6_addr, rloc_addr.mFields.m8, 16);
+
+                    const char *ml_eid_req = "GET_MLEID";
+                    sendto(sock, ml_eid_req, strlen(ml_eid_req), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+                    char response[128];
+                    struct sockaddr_in6 src_addr;
+                    socklen_t src_len = sizeof(src_addr);
+                    int recv_len =
+                        recvfrom(sock, response, sizeof(response) - 1, 0, (struct sockaddr *)&src_addr, &src_len);
+
+                    if (recv_len > 0 && strncmp(response, "MLEID:", 6) == 0) {
+                        response[recv_len] = '\0';
+                        strncpy(ml_eid_str, response + 6, ml_eid_str_len - 1);
+                        ml_eid_str[ml_eid_str_len - 1] = '\0';
+                        ESP_LOGI(TAG, "Got ML-EID from device: %s", ml_eid_str);
+
+                        // Register it
+                        esp_ot_mqtt_register_device(mac_str, ml_eid_str);
+
+                        close(sock);
+                        return ESP_OK;
+                    }
+
+                    close(sock);
+                }
+            }
+            break;
+        }
+    }
+
     return ESP_ERR_NOT_FOUND;
 }
 
